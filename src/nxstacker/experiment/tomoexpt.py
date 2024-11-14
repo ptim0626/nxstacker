@@ -13,11 +13,10 @@ from itertools import chain
 from pathlib import Path
 from types import MappingProxyType
 
-import numpy as np
-
 from nxstacker.io.nxtomo.minimal import LINK_DATA, LINK_ROT_ANG, create_minimal
 from nxstacker.utils.logger import create_logger
 from nxstacker.utils.model import (
+    CompressionBlosc,
     Directory,
     ExperimentFacility,
     FilePath,
@@ -38,6 +37,7 @@ class TomoExpt:
     proj_file = FilePath(undefined_ok=True)
     nxtomo_dir = Directory()
     raw_dir = Directory(undefined_ok=True, must_exist=True)
+    skip_proj_file_check = FixedValue()
     facility = ExperimentFacility()
     include_scan = IdentifierRange(int)
     include_proj = IdentifierRange(int)
@@ -48,6 +48,7 @@ class TomoExpt:
     sort_by_angle = FixedValue()
     pad_to_max = FixedValue()
     compress = FixedValue()
+    compression_settings = FixedValue()
     metadata = FixedValue()
     nxtomo_output_files = FixedValue()
     logger = FixedValue()
@@ -65,12 +66,14 @@ class TomoExpt:
         sort_by_angle,
         pad_to_max,
         compress,
+        skip_proj_file_check,
     ):
         """Initialise a tomography experiment."""
         self.proj_dir = proj_dir
         self.proj_file = proj_file
         self.nxtomo_dir = nxtomo_dir
         self.raw_dir = raw_dir
+        self.skip_proj_file_check = skip_proj_file_check
 
         self.facility = facility
 
@@ -82,6 +85,12 @@ class TomoExpt:
         self.sort_by_angle = sort_by_angle
         self.pad_to_max = pad_to_max
         self.compress = compress
+
+        # define the instance holding the compression attributes
+        if self.compress:
+            self.compression_settings = CompressionBlosc()
+        else:
+            self.compression_settings = None
 
         self.projections = []
         self.stack_shape = ()
@@ -115,7 +124,7 @@ class TomoExpt:
             stack_shape,
             stack_dtype,
             self.facility,
-            compress=self.compress,
+            compression_settings=self.compression_settings,
             **md_dict,
         )
         return filename
@@ -201,38 +210,6 @@ class TomoExpt:
                 break
         self._proj_dir = Path(proj_dir).resolve()
 
-    def _save_proj_to_dset(self, fh, proj_index, proj, angle):
-        proj_dset = fh[self.proj_dset_path]
-        proj_dset[proj_index, :, :] = proj
-
-        rot_ang_dset = fh[self.rot_ang_dset_path]
-        rot_ang_dset[proj_index] = angle
-
-    def _resize_proj(self, proj, stack_shape):
-        proj_y, proj_x = proj.shape
-        stack_y, stack_x = stack_shape[1:]
-
-        if self.pad_to_max and (proj_y < stack_y or proj_x < stack_x):
-            # pad to stack shape if the projection is smaller than
-            # others
-            y_diff = stack_y - proj_y
-            top = y_diff // 2
-            bottom = top + y_diff % 2
-
-            x_diff = stack_x - proj_x
-            left = x_diff // 2
-            right = left + x_diff % 2
-
-            final = np.pad(
-                proj,
-                ((top, bottom), (left, right)),
-                mode="symmetric",
-            )
-        else:
-            final = proj
-
-        return final
-
     def _gather_raw_dir_from_proj_file(self):
         if self.num_projections != 0:
             return list(dict.fromkeys(f.raw_dir for f in self.projections))
@@ -313,6 +290,21 @@ class TomoExpt:
         logger.info(
             f"The directory to look for projections is '{self.proj_dir}'."
         )
+        if self.skip_proj_file_check:
+            logger.info(
+                "Skipping the validation of projection files in the above "
+                "directory."
+            )
+            if self.short_name == "ptycho":
+                assume_file_type = self.facility.ptycho_file_type[0]
+            elif self.short_name == "xrf":
+                assume_file_type = self.facility.xrf_file_type[0]
+            else:
+                assume_file_type = "'unknown'"
+            logger.info(
+                f"Assume the projection files are from {assume_file_type}."
+            )
+
         st = time.perf_counter()
         return st
 
@@ -370,7 +362,8 @@ class TomoExpt:
             f"'{self.metadata.sample_description}'."
         )
         logger.info(
-            "The detector distance is {self.metadata.detector_distance:.3e} m."
+            "The detector distance is "
+            f"{self.metadata.detector_distance:.3e} m."
         )
         logger.info(f"The x pixel size is {self.metadata.x_pixel_size:.3e} m.")
         logger.info(f"The y pixel size is {self.metadata.y_pixel_size:.3e} m.")

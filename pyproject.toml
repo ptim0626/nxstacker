@@ -4,8 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nxstacker"
-version = "2024.5"
+version = "2024.11"
 dependencies = [
+  "blosc",
   "h5py",
   "hdf5plugin",
   "numpy",
@@ -13,7 +14,7 @@ dependencies = [
   "scikit-image",
   "xraylib",
 ]
-requires-python = " ~= 3.10.0 "
+requires-python = " >= 3.10 "
 description = "An utility to produce NeXus-compliance file from a stack"
 readme = "README.md"
 authors = [
@@ -29,6 +30,9 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
 ]
 
 [project.urls]
@@ -36,6 +40,13 @@ Repository = "https://github.com/DiamondLightSource/nxstacker"
 
 [project.scripts]
 "tomojoin" = "nxstacker.tomojoin:tomojoin_entry"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 "nxstacker.facility.specs" = ["*.yaml"]

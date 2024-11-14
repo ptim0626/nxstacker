@@ -1,5 +1,6 @@
 from collections import deque
 from contextlib import nullcontext
+from multiprocessing import Manager, Pool, Process
 from types import MappingProxyType
 
 import h5py
@@ -9,7 +10,11 @@ from nxstacker.experiment.tomoexpt import TomoExpt
 from nxstacker.io.nxtomo.metadata import MetadataPtycho
 from nxstacker.io.ptycho.ptypy import PtyPyFile
 from nxstacker.io.ptycho.ptyrex import PtyREXFile
-from nxstacker.utils.io import file_has_paths
+from nxstacker.utils.io import (
+    file_has_paths,
+    pad2stack,
+    save_proj_to_h5,
+)
 from nxstacker.utils.logger import create_logger
 from nxstacker.utils.model import FixedValue
 from nxstacker.utils.parse import quote_iterable, unique_or_raise
@@ -18,6 +23,7 @@ from nxstacker.utils.ptychography import (
     remove_phase_ramp,
     unwrap_phase,
 )
+from nxstacker.utils.resource import num_cpus
 
 
 class PtychoTomo(TomoExpt):
@@ -53,6 +59,7 @@ class PtychoTomo(TomoExpt):
         sort_by_angle=False,
         pad_to_max=True,
         compress=False,
+        skip_proj_file_check=False,
         **kwargs,
     ):
         """Initialise the instance.
@@ -100,6 +107,11 @@ class PtychoTomo(TomoExpt):
         compress : bool, optional
             whether to apply compression (Blosc) to the NXtomo file.
             Default to False.
+        skip_proj_file_check : bool, optional
+            whether to skip the file check when adding an hdf5 to the list
+            of projection files. Usually this is true when you are doing a
+            typical stacking and sure no other hdf5 files are present in
+            proj_dir. Default to False.
         kwargs : dict, optional
             options for ptycho-tomography
 
@@ -116,6 +128,7 @@ class PtychoTomo(TomoExpt):
             sort_by_angle=sort_by_angle,
             pad_to_max=pad_to_max,
             compress=compress,
+            skip_proj_file_check=skip_proj_file_check,
         )
 
         self._save_complex = kwargs.get("save_complex", False)
@@ -126,12 +139,19 @@ class PtychoTomo(TomoExpt):
         self._unwrap_phase = kwargs.get("unwrap_phase", False)
         self._rescale = kwargs.get("rescale", False)
 
-    def find_all_projections(self):
+    def find_all_projections(self, *, parallel=True):
         """Find all projections.
 
         It goes through files and directories in self.proj_dir, add the
         file to self.projections if they should be included as informed
         by self.include_scan and self.include_proj.
+
+        Parameters
+        ----------
+        parallel : bool, optional
+            parallelise the finding of projection files. Default to
+            True.
+
         """
         pty_files = deque()
 
@@ -141,40 +161,121 @@ class PtychoTomo(TomoExpt):
             extensions = self._supported_extensions()
             file_iter = self.proj_dir.glob(f"**/*[{','.join(extensions)}]")
 
-        for fp in file_iter:
-            # look at the keys of the file to determine its type
-            if h5py.is_hdf5(fp):
-                if file_has_paths(fp, PtyPyFile.essential_paths):
-                    # for PtyPy file, projection number doesn't matter
-                    pty_file = PtyPyFile(
-                        fp, id_proj=0, verify=False, raw_dir=self.raw_dir
-                    )
+        # set the flags of whether assuming they are of a specified
+        # projection file type and the order to validate file if no such
+        # assumption is make
+        self._assume_file_order()
 
-                    to_include = pty_file.id_scan in self.include_scan
-
-                    if to_include:
-                        pty_file.fill_attr()
+        if parallel:
+            ncpus = num_cpus()
+            with Pool(processes=ncpus) as pool:
+                for pty_file in pool.imap_unordered(
+                    self._find_proj, file_iter
+                ):
+                    if pty_file is not None:
                         pty_files.append(pty_file)
-
-                elif file_has_paths(fp, PtyREXFile.essential_paths):
-                    pty_file = PtyREXFile(
-                        fp, verify=False, raw_dir=self.raw_dir
-                    )
-
-                    to_include = (
-                        pty_file.id_scan in self.include_scan
-                        and pty_file.id_proj in self.include_proj
-                    )
-
-                    if to_include:
-                        pty_file.fill_attr()
-                        pty_files.append(pty_file)
+        else:
+            # serial
+            for fp in file_iter:
+                pty_file = self._find_proj(fp)
+                if pty_file is not None:
+                    pty_files.append(pty_file)
 
         self._projections = self._preliminary_sort(pty_files)
 
         if self.num_projections == 0:
             msg = f"No valid projection has been found in {self.proj_dir}"
             raise RuntimeError(msg)
+
+    def _assume_file_order(self):
+        if self.skip_proj_file_check:
+            self._assume_ptypy_file = "PtyPy" in self.facility.ptycho_file_type
+            self._assume_ptyrex_file = (
+                "PtyREX" in self.facility.ptycho_file_type
+            )
+
+            # these are not used
+            self._order_paths = ()
+            self._order_init = ()
+        else:
+            self._assume_ptypy_file = False
+            self._assume_ptyrex_file = False
+
+            # now it won't skip checking, so give preference to the
+            # assumed file type as the ordering of checking impacts the
+            # speed
+            if "PtyPy" in self.facility.ptycho_file_type:
+                self._order_paths = (
+                    PtyPyFile.essential_paths,
+                    PtyREXFile.essential_paths,
+                )
+                self._order_init = (
+                    self._init_ptypy_file,
+                    self._init_ptyrex_file,
+                )
+            elif "PtyREX" in self.facility.ptycho_file_type:
+                self._order_paths = (
+                    PtyREXFile.essential_paths,
+                    PtyPyFile.essential_paths,
+                )
+                self._order_init = (
+                    self._init_ptyrex_file,
+                    self._init_ptypy_file,
+                )
+            else:
+                msg = (
+                    "Unsupported ptychography file type "
+                    f"'{self.facility.ptycho_file_type}'."
+                )
+                raise ValueError(msg)
+
+    def _find_proj(self, fp):
+        pty_file = None
+        to_include = False
+        if h5py.is_hdf5(fp):
+            if any([self._assume_ptypy_file, self._assume_ptyrex_file]):
+                # no check, quicker but less safe
+                if self._assume_ptypy_file:
+                    pty_file, to_include = self._init_ptypy_file(fp)
+                elif self._assume_ptyrex_file:
+                    pty_file, to_include = self._init_ptyrex_file(fp)
+            else:
+                # look at the keys of the file to determine its type
+                # from a preferred order as determined by the
+                # facility, slower but safer
+                for ep, init_method in zip(
+                    self._order_paths, self._order_init, strict=False
+                ):
+                    if file_has_paths(fp, ep):
+                        pty_file, to_include = init_method(fp)
+                        break
+
+            # fill the attribute of the file if it should be included
+            # and return the file, otherwise return None
+            if to_include:
+                pty_file.fill_attr()
+                return pty_file
+            return None
+
+        return pty_file
+
+    def _init_ptypy_file(self, fp):
+        # for PtyPy file, projection number doesn't matter
+        pty_file = PtyPyFile(fp, id_proj=0, verify=False, raw_dir=self.raw_dir)
+
+        to_include = pty_file.id_scan in self.include_scan
+
+        return pty_file, to_include
+
+    def _init_ptyrex_file(self, fp):
+        pty_file = PtyREXFile(fp, verify=False, raw_dir=self.raw_dir)
+
+        to_include = (
+            pty_file.id_scan in self.include_scan
+            and pty_file.id_proj in self.include_proj
+        )
+
+        return pty_file, to_include
 
     def _preliminary_sort(self, files):
         software = {file.software for file in files}
@@ -277,75 +378,80 @@ class PtychoTomo(TomoExpt):
 
         nxtomo_cplx, nxtomo_modl, nxtomo_phas = self._nxtomo_minimal()
 
-        cplx_cm = (
-            nullcontext()
-            if nxtomo_cplx is None
-            else h5py.File(nxtomo_cplx, "r+")
-        )
-        modl_cm = (
-            nullcontext()
-            if nxtomo_modl is None
-            else h5py.File(nxtomo_modl, "r+")
-        )
-        phas_cm = (
-            nullcontext()
-            if nxtomo_phas is None
-            else h5py.File(nxtomo_phas, "r+")
-        )
+        read_cplx = nxtomo_cplx is not None
+        read_modl = nxtomo_modl is not None
+        read_phas = nxtomo_phas is not None
 
-        with cplx_cm as f_cplx, modl_cm as f_modl, phas_cm as f_phas:
-            for k, pty_file in enumerate(self._projections):
-                rot_ang = pty_file.id_angle
+        # parallelise when more than 50 projections
+        parallel = self.num_projections >= 50
 
-                if pty_file.avail_complex:
-                    # if complex data is present, use it to get
-                    # modulus/phase to reduce latency from I/O
-                    ob_cplx = pty_file.object_complex(mode=mode)
+        if parallel:
+            ncpus = num_cpus()
 
-                    if f_cplx:
-                        complex_ = self._resize_proj(ob_cplx, self.stack_shape)
+            # to avoid over-subscribe we set the blosc thread to 1
+            # if doing multiprocessing
+            if self.compression_settings is not None:
+                self.compression_settings.set_nthreads(1)
 
-                        self._save_proj_to_dset(f_cplx, k, complex_, rot_ang)
+            with Manager() as manager:
+                queue = manager.Queue()
 
-                    if f_modl:
-                        ob_modl = np.abs(ob_cplx)
-                        modulus = self._resize_proj(ob_modl, self.stack_shape)
+                # initiate the hdf5 writing process
+                write_proc = Process(
+                    target=self._parallel_cplx_modl_phas,
+                    args=(nxtomo_cplx, nxtomo_modl, nxtomo_phas, queue),
+                )
+                write_proc.start()
 
-                        self._save_proj_to_dset(f_modl, k, modulus, rot_ang)
+                with Pool(ncpus) as pool:
+                    tasks = (
+                        (
+                            k,
+                            pty_file,
+                            mode,
+                            read_cplx,
+                            read_modl,
+                            read_phas,
+                            queue,
+                        )
+                        for k, pty_file in enumerate(self._projections)
+                    )
+                    chunk_sz = self.num_projections // ncpus + 1
 
-                    if f_phas:
-                        if self._remove_ramp:
-                            ob_cplx = remove_phase_ramp(ob_cplx)
-                        if self._median_norm:
-                            ob_cplx = phase_shift(
-                                ob_cplx,
-                                -np.median(np.angle(ob_cplx)),
-                            )
+                    # distribute the reading to a pool of workers
+                    # the result is put into a queue when they are read
+                    pool.starmap_async(
+                        self._read_cplx_modl_phas, tasks, chunksize=chunk_sz
+                    )
 
-                        ob_phas = np.angle(ob_cplx)
-                        phase = self._resize_proj(ob_phas, self.stack_shape)
-                        if self._unwrap_phase:
-                            phase = unwrap_phase(phase)
+                    # .join before .close, essential
+                    pool.close()
+                    pool.join()
 
-                        self._save_proj_to_dset(f_phas, k, phase, rot_ang)
-                else:
-                    # complex not availabe, only save modulus/phase
-                    if f_modl:
-                        ob_modl = pty_file.object_modulus(mode=mode)
-                        modulus = self._resize_proj(ob_modl, self.stack_shape)
+                # send termination signal to the queue
+                queue.put(None)
 
-                        self._save_proj_to_dset(f_modl, k, modulus, rot_ang)
-
-                    if f_phas:
-                        if self._remove_ramp or self._median_norm:
-                            # log warning here
-                            pass
-                        ob_phas = pty_file.object_phase(mode=mode)
-                        phase = self._resize_proj(ob_phas, self.stack_shape)
-                        if self._unwrap_phase:
-                            phase = unwrap_phase(phase)
-
-                        self._save_proj_to_dset(f_phas, k, phase, rot_ang)
+                write_proc.join()
+        else:
+            # serial
+            queue = None
+            cplx_cm, modl_cm, phas_cm = self._create_cm(
+                nxtomo_cplx, nxtomo_modl, nxtomo_phas
+            )
+            with cplx_cm as f_cplx, modl_cm as f_modl, phas_cm as f_phas:
+                for k, pty_file in enumerate(self._projections):
+                    proj_pack = self._read_cplx_modl_phas(
+                        k,
+                        pty_file,
+                        mode,
+                        read_cplx,
+                        read_modl,
+                        read_phas,
+                        queue,
+                    )
+                    self._serial_cplx_modl_phas(
+                        proj_pack, f_cplx, f_modl, f_phas
+                    )
 
         nxtomo_files = []
         if nxtomo_cplx is not None:
@@ -383,6 +489,25 @@ class PtychoTomo(TomoExpt):
             )
 
         return (self.num_projections, *ob_sh)
+
+    def _create_cm(self, nxtomo_cplx, nxtomo_modl, nxtomo_phas):
+        cplx_cm = (
+            nullcontext()
+            if nxtomo_cplx is None
+            else h5py.File(nxtomo_cplx, "r+")
+        )
+        modl_cm = (
+            nullcontext()
+            if nxtomo_modl is None
+            else h5py.File(nxtomo_modl, "r+")
+        )
+        phas_cm = (
+            nullcontext()
+            if nxtomo_phas is None
+            else h5py.File(nxtomo_phas, "r+")
+        )
+
+        return cplx_cm, modl_cm, phas_cm
 
     def _nxtomo_cplx_minimal(self):
         if self._save_complex and all(
@@ -449,6 +574,152 @@ class PtychoTomo(TomoExpt):
             nxtomo_phas = None
 
         return nxtomo_phas
+
+    def _serial_cplx_modl_phas(self, proj_pack, f_cplx, f_modl, f_phas):
+        """Write serially."""
+        # h5py File objects are available
+        k, rot_ang, complex_, modulus, phase = proj_pack
+        angle_data = {
+            "data": rot_ang,
+            "key": self.rot_ang_dset_path,
+        }
+
+        self._save_cplx_to_file(k, f_cplx, complex_, angle_data)
+        self._save_modl_to_file(k, f_modl, modulus, angle_data)
+        self._save_phas_to_file(k, f_phas, phase, angle_data)
+
+    def _parallel_cplx_modl_phas(
+        self, nxtomo_cplx, nxtomo_modl, nxtomo_phas, queue
+    ):
+        """Write in parallel using data from queue."""
+        cplx_cm, modl_cm, phas_cm = self._create_cm(
+            nxtomo_cplx, nxtomo_modl, nxtomo_phas
+        )
+
+        with cplx_cm as f_cplx, modl_cm as f_modl, phas_cm as f_phas:
+            while True:
+                proj_pack = queue.get()
+
+                # signal to terminate
+                if proj_pack is None:
+                    break
+
+                # if not terminated, unpack
+                k, rot_ang, complex_, modulus, phase = proj_pack
+                angle_data = {
+                    "data": rot_ang,
+                    "key": self.rot_ang_dset_path,
+                }
+
+                self._save_cplx_to_file(k, f_cplx, complex_, angle_data)
+                self._save_modl_to_file(k, f_modl, modulus, angle_data)
+                self._save_phas_to_file(k, f_phas, phase, angle_data)
+
+    def _save_cplx_to_file(self, k, f_cplx, complex_, angle_data):
+        if f_cplx and complex_ is not None:
+            cplx_data = {
+                "data": complex_,
+                "key": self.proj_dset_path,
+            }
+            save_proj_to_h5(
+                f_cplx, k, cplx_data, angle_data, self.compression_settings
+            )
+
+    def _save_modl_to_file(self, k, f_modl, modulus, angle_data):
+        if f_modl and modulus is not None:
+            modl_data = {
+                "data": modulus,
+                "key": self.proj_dset_path,
+            }
+            save_proj_to_h5(
+                f_modl, k, modl_data, angle_data, self.compression_settings
+            )
+
+    def _save_phas_to_file(self, k, f_phas, phase, angle_data):
+        if f_phas and phase is not None:
+            phas_data = {
+                "data": phase,
+                "key": self.proj_dset_path,
+            }
+            save_proj_to_h5(
+                f_phas, k, phas_data, angle_data, self.compression_settings
+            )
+
+    def _read_cplx_modl_phas(
+        self, k, pty_file, mode, read_cplx, read_modl, read_phas, queue
+    ):
+        """Put projections image into a queue or return them."""
+        rot_ang = pty_file.id_angle
+
+        complex_ = None
+        modulus = None
+        phase = None
+
+        if pty_file.avail_complex:
+            # if complex data is present, use it to get
+            # modulus/phase to reduce latency from i/o
+            ob_cplx = pty_file.object_complex(mode=mode)
+
+            if read_cplx:
+                if self.pad_to_max:
+                    complex_ = pad2stack(ob_cplx, self.stack_shape)
+                else:
+                    complex_ = ob_cplx
+
+            if read_modl:
+                ob_modl = np.abs(ob_cplx)
+                if self.pad_to_max:
+                    modulus = pad2stack(ob_modl, self.stack_shape)
+                else:
+                    modulus = ob_modl
+
+            if read_phas:
+                if self._remove_ramp:
+                    ob_cplx = remove_phase_ramp(ob_cplx)
+                if self._median_norm:
+                    ob_cplx = phase_shift(
+                        ob_cplx,
+                        -np.median(np.angle(ob_cplx)),
+                    )
+
+                ob_phas = np.angle(ob_cplx)
+                if self.pad_to_max:
+                    phase = pad2stack(ob_phas, self.stack_shape)
+                else:
+                    phase = ob_phas
+
+                if self._unwrap_phase:
+                    phase = unwrap_phase(phase)
+
+        else:
+            # complex not availabe, only save modulus/phase
+            if read_modl:
+                ob_modl = pty_file.object_modulus(mode=mode)
+                if self.pad_to_max:
+                    modulus = pad2stack(ob_modl, self.stack_shape)
+                else:
+                    modulus = ob_modl
+
+            if read_phas:
+                if self._remove_ramp or self._median_norm:
+                    # log warning here
+                    pass
+                ob_phas = pty_file.object_phase(mode=mode)
+                if self.pad_to_max:
+                    phase = pad2stack(ob_phas, self.stack_shape)
+                else:
+                    phase = ob_phas
+
+                if self._unwrap_phase:
+                    phase = unwrap_phase(phase)
+
+        if queue is None:
+            # serial
+            return k, rot_ang, complex_, modulus, phase
+
+        # parallel, put results in the queue
+        queue.put((k, rot_ang, complex_, modulus, phase))
+        return None
 
     def _log_enter_stack_projection(self, level, name):
         st = super()._log_enter_stack_projection(level, name)
